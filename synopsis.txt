@@ -1,0 +1,230 @@
+Submitted by   : ___________________________
+Submitted to   : ___________________________
+Name           : ___________________________
+Class          : ___________________________
+Roll Number    : ___________________________
+
+
+Bluetooth HID Air Mouse Using ESP32 and MPU6500 Gyroscope Sensor
+
+
+ABSTRACT
+
+This project presents the design and implementation of a Bluetooth HID Air Mouse using an
+ESP32 microcontroller and an MPU6500 six-axis Inertial Measurement Unit (IMU). The system
+enables wireless mouse functionality by translating the physical orientation and motion of a
+handheld device into precise cursor movements on a host computer or smart device through the
+Bluetooth Low Energy (BLE) Human Interface Device (HID) protocol.
+
+The MPU6500 gyroscope sensor continuously measures angular velocity across three axes. The
+firmware processes this data through a bias calibration stage, an exponential low-pass filter,
+and a dead-zone threshold before converting the result into relative cursor displacement values.
+These HID mouse reports are transmitted over BLE, allowing the host operating system to
+recognise the device as a standard hardware mouse without any additional drivers or software
+installation.
+
+Physical push buttons provide left-click and right-click functionality with hardware debouncing
+logic implemented in firmware. The system supports 100 Hz reporting, real-time connection
+status indication via an onboard LED, and automatic gyroscope calibration at startup.
+
+The project demonstrates the integration of embedded systems, inertial sensing, and wireless
+communication protocols into a compact, driver-free, and platform-independent pointing device.
+
+
+INTRODUCTION
+
+Conventional computer mice rely on optical or mechanical sensors placed on flat surfaces,
+limiting their usability in presentations, digital art, accessibility applications, and gesture-based
+interfaces. An Air Mouse eliminates the requirement for a flat surface by using motion sensing
+to control the cursor, offering a more intuitive and versatile interaction method.
+
+With the widespread adoption of Bluetooth Low Energy in modern computing devices, BLE HID
+has become the standard protocol for wireless peripherals such as keyboards, mice, and
+gamepads. Unlike proprietary wireless dongles, BLE HID is natively supported across Windows,
+macOS, Linux, Android, and iOS, enabling universal compatibility without driver installation.
+
+This project addresses the need for an affordable, low-latency, and fully standards-compliant
+air mouse by combining the ESP32 system-on-chip, which provides integrated BLE hardware,
+with the MPU6500 IMU, which provides precise angular velocity measurement. The result is a
+self-contained device that behaves identically to a standard Bluetooth mouse from the
+perspective of any host operating system.
+
+
+OBJECTIVES
+
+- To develop a motion-controlled pointing device using gyroscope-based sensing
+- To implement a fully compliant Bluetooth Low Energy HID mouse on ESP32
+- To achieve accurate and smooth cursor control through sensor signal processing
+- To provide left-click and right-click functionality with debounced physical buttons
+- To eliminate the need for proprietary dongles or custom drivers on the host device
+- To design a modular and configurable firmware suitable for further extension
+
+
+SYSTEM ARCHITECTURE
+
+The system consists of three principal layers:
+
+Sensor and Input Layer:
+The MPU6500 IMU communicates with the ESP32 over I2C at 400 kHz. It supplies raw
+gyroscope readings at 200 Hz. Two tactile push buttons connected to GPIO pins with internal
+pull-up resistors provide click input.
+
+Processing Layer (ESP32 Firmware):
+The firmware implements the complete signal processing pipeline, including gyroscope
+initialisation, bias calibration, low-pass filtering, dead-zone suppression, sub-pixel
+accumulation, and HID report generation. FreeRTOS, provided by the ESP-IDF framework,
+manages the BLE stack concurrently with the main sensor loop.
+
+Communication Layer:
+The ESP32 BLE stack exposes a standard HID-over-GATT profile. The host device discovers
+and pairs with the unit as a Bluetooth mouse named "Air Mouse". All cursor movement and
+button events are transmitted as standard HID mouse reports over BLE notifications.
+
+
+METHODOLOGY
+
+The system operates through the following sequence:
+
+1. At power-on, the ESP32 initialises the I2C bus and configures the MPU6500 registers,
+   setting the gyroscope full-scale range to ±500 degrees per second and enabling the
+   onboard digital low-pass filter at a 41 Hz bandwidth.
+
+2. A 500-sample bias calibration routine measures the static gyroscope offset on all three
+   axes while the device is held stationary. This offset is subtracted from all subsequent
+   readings to eliminate drift.
+
+3. The BLE HID mouse service is started, and the device begins advertising under the name
+   "Air Mouse". The onboard LED blinks to indicate the advertising state.
+
+4. Upon connection, the main processing loop runs at approximately 100 Hz. Each iteration
+   reads raw gyroscope data, applies an exponential moving average low-pass filter, and
+   suppresses readings below the dead-zone threshold to prevent cursor drift when the
+   device is held still.
+
+5. The filtered angular velocity values are scaled by a configurable sensitivity factor and
+   multiplied by the actual elapsed time (dt) to produce fractional pixel displacements.
+   A sub-pixel accumulator retains remainders between frames to prevent quantisation loss
+   at low movement speeds.
+
+6. Integer cursor deltas are extracted from the accumulator and transmitted as a standard
+   HID mouse movement report over BLE.
+
+7. Button states are polled each iteration. State changes that persist beyond the debounce
+   period result in HID mouse press or release events being sent to the host.
+
+8. Upon disconnection, filter and accumulator states are reset to prevent stale values from
+   causing a sudden cursor jump on reconnection.
+
+
+HARDWARE REQUIREMENTS
+
+- ESP32 Development Board (ESP32-DevKitC or equivalent)
+- MPU6500 IMU Breakout Module (or GY-6500)
+- Two tactile push buttons
+- Connecting wires
+- 3.3 V compatible power supply or USB power bank
+- Wi-Fi and Bluetooth antenna (integrated on ESP32 module)
+
+
+SOFTWARE REQUIREMENTS
+
+- PlatformIO IDE (with espressif32 platform)
+- Arduino Framework for ESP32
+- ESP32-BLE-Mouse Library (T-vK, open source, GitHub)
+- Arduino Wire Library (I2C, included in framework)
+- Host OS with native Bluetooth Low Energy HID support
+  (Windows 10 and above, macOS, Linux, Android, iOS)
+
+
+IMPLEMENTATION
+
+Firmware (ESP32):
+The firmware is written in C++ using the Arduino framework under PlatformIO. It is structured
+into distinct functional modules: MPU6500 register-level I2C driver, bias calibration routine,
+signal processing pipeline, BLE HID mouse interface, and button handling with debouncing.
+
+The MPU6500 driver communicates directly with the sensor registers without relying on a
+third-party sensor library, ensuring full compatibility with the MPU6500 WHO_AM_I identifier
+(0x70) as well as compatible variants (MPU6050, MPU9250).
+
+The BLE HID layer uses the ESP32-BLE-Mouse library, which implements the HID-over-GATT
+profile on top of the native ESP32 BLE stack included in the espressif32 platform.
+
+Axis Mapping:
+- Gyroscope Z axis (yaw: sweeping hand left or right)  → cursor X displacement
+- Gyroscope X axis (pitch: tilting hand up or down)    → cursor Y displacement
+
+Signal Processing Pipeline:
+Raw reading → Bias subtraction → Exponential LPF (alpha = 0.25) → Dead zone (1.8 °/s)
+→ Sensitivity scaling (15.0) × dt → Sub-pixel accumulator → int8 HID delta
+
+Button Handling:
+Each button is read as active-low using the ESP32 internal pull-up. A 30 ms software debounce
+timer prevents false triggers. Press and release events are sent as separate HID reports,
+enabling proper drag and hold operations.
+
+
+RESULTS
+
+The implemented system successfully functions as a standard Bluetooth HID mouse across
+Windows, macOS, and Android hosts without driver installation. The cursor responds accurately
+to hand orientation changes with low perceptible latency.
+
+Gyroscope bias calibration effectively removes static drift, and the low-pass filter combined
+with the dead zone provides stable cursor behaviour when the device is held stationary. The
+sub-pixel accumulator ensures that slow, precise movements are captured without stepping.
+Both click buttons operate reliably with clean press and release transitions.
+
+The onboard LED provides clear visual feedback: slow blinking during BLE advertising and
+solid illumination upon successful connection.
+
+
+ADVANTAGES
+
+- No flat surface required; works in open air during presentations or demonstrations
+- Universal compatibility through standard BLE HID with no dongles or drivers
+- Low-latency 100 Hz reporting for responsive cursor control
+- Automatic gyroscope calibration eliminates manual offset adjustment
+- Sub-pixel accumulation ensures smooth movement at all sensitivity levels
+- Configurable sensitivity, dead zone, and filter parameters via compile-time constants
+- Compact and self-contained single-board implementation
+
+
+APPLICATIONS
+
+- Academic and professional presentations (replacing laser pointers)
+- Accessibility devices for users with limited mobility
+- Interactive digital art and gesture-based creative tools
+- Smart TV and media centre remote control
+- Robotics and drone control interfaces
+- Educational demonstrations of IMU-based motion sensing
+- Wearable computing and head-mounted display interaction
+
+
+FUTURE SCOPE
+
+- Integration of scroll wheel functionality using the accelerometer axis
+- Implementation of a complementary or Madgwick filter for absolute orientation tracking
+- Addition of a dedicated recalibration button to reset gyro bias during use
+- Battery level reporting over BLE to display charge status on the host
+- Gesture recognition for predefined macro commands (double tap, shake, etc.)
+- 3D-printed enclosure design for a production-ready form factor
+- Low-power sleep mode with motion-based wake to extend battery life
+- Mobile application for configuring sensitivity and button mappings over BLE
+
+
+CONCLUSION
+
+This project demonstrates the successful implementation of a Bluetooth HID Air Mouse using
+an ESP32 microcontroller and an MPU6500 gyroscope sensor. By leveraging the standard
+HID-over-GATT Bluetooth profile, the device achieves complete plug-and-play compatibility
+with modern operating systems without requiring proprietary software or wireless adapters.
+
+The firmware incorporates a robust signal processing pipeline that addresses the fundamental
+challenges of gyroscope-based cursor control, namely sensor bias, noise, and quantisation,
+producing smooth and accurate cursor movement. The modular architecture of the codebase
+allows straightforward extension with additional sensors, gestures, or communication channels.
+
+The project validates the viability of low-cost embedded platforms for implementing
+professional-grade wireless HID peripherals and provides a strong foundation for further
+research and development in motion-based human-computer interaction.
