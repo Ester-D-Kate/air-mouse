@@ -3,113 +3,125 @@
  *  Air Mouse – ESP32 + MPU6500 + Bluetooth HID
  * ============================================================
  *
- *  Wiring
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │  SENSITIVITY — change this number to tune speed     │
+ *  │  3 = very slow/precise   8 = default   20 = fast    │
+ *  └─────────────────────────────────────────────────────┘
+ *
+ *  HOW IT WORKS
+ *  ─────────────
+ *  D23 floating (not pressed) → cursor moves freely
+ *  D23 to GND   (pressed)     → cursor freezes
+ *  Press D19 → Left  click
+ *  Press D18 → Right click
+ *
+ *  WIRING
  *  ──────
- *  MPU6500  →  ESP32
- *  VCC      →  3.3V
- *  GND      →  GND
- *  SDA      →  GPIO 21
- *  SCL      →  GPIO 22
- *  AD0      →  GND   (I2C address = 0x68)
+ *  MPU6500 VCC  →  3.3V
+ *  MPU6500 GND  →  GND
+ *  MPU6500 SDA  →  GPIO 21
+ *  MPU6500 SCL  →  GPIO 22
+ *  MPU6500 AD0  →  GND
  *
- *  Left-click button  : GPIO 26 → GND  (internal pull-up)
- *  Right-click button : GPIO 27 → GND  (internal pull-up)
+ *  Freeze button : one leg → GPIO 23, other leg → GND
+ *  Left  button  : one leg → GPIO 19, other leg → GND
+ *  Right button  : one leg → GPIO 18, other leg → GND
  *
- *  Library required (add to platformio.ini lib_deps):
- *    https://github.com/T-vK/ESP32-BLE-Mouse.git
+ *  LED STATUS
+ *  ──────────
+ *  Slow blink (500 ms) = advertising, waiting to pair
+ *  Fast blink (100 ms) = paired, finishing BLE setup
+ *  Solid ON            = ready to use
  *
- *  Axis mapping (sensor chip facing up, USB port of dev-board down):
- *    Gyro Z  (yaw  – sweep left/right)  →  cursor X
- *    Gyro X  (pitch – tilt  up/down)    →  cursor Y
- *
- *  Tuning knobs:
- *    SENSITIVITY   – higher = faster cursor
- *    DEAD_ZONE_DPS – higher = more stillness needed before cursor moves
- *    LPF_ALPHA     – lower = smoother but laggier (0.1–0.5 is typical)
+ *  LIBRARY NEEDED (platformio.ini lib_deps)
+ *  ─────────────────────────────────────────
+ *  https://github.com/T-vK/ESP32-BLE-Mouse.git
  * ============================================================
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <BleMouse.h>
+#include <esp_log.h>     // lets us silence the harmless rc=-1 BLE log messages
 
-// ═══════════════════════════════════════════════════════════════
-//  Pin definitions
-// ═══════════════════════════════════════════════════════════════
-#define I2C_SDA             21
-#define I2C_SCL             22
-#define PIN_BTN_LEFT        26
-#define PIN_BTN_RIGHT       27
-#define LED_BUILTIN_PIN      2   // onboard LED – connection indicator
+// ─────────────────────────────────────────────────────────────
+//  SENSITIVITY  ← CHANGE THIS NUMBER TO ADJUST CURSOR SPEED
+//  3 = very slow / precise
+//  8 = default (good starting point)
+//  20 = very fast
+// ─────────────────────────────────────────────────────────────
+#define SENSITIVITY       20.0f
 
-// ═══════════════════════════════════════════════════════════════
-//  MPU6500 register map
-// ═══════════════════════════════════════════════════════════════
-#define MPU_ADDR            0x68   // AD0 LOW → 0x68 | AD0 HIGH → 0x69
+// ─────────────────────────────────────────────────────────────
+//  PINS
+// ─────────────────────────────────────────────────────────────
+#define PIN_SDA          21
+#define PIN_SCL          22
+#define PIN_FREEZE       23   // Press (to GND) = freeze cursor | Release = cursor moves
+#define PIN_LEFT         19   // Left click
+#define PIN_RIGHT        18   // Right click
+#define PIN_LED           2   // Built-in LED
 
-#define REG_SMPLRT_DIV      0x19
-#define REG_CONFIG          0x1A
-#define REG_GYRO_CONFIG     0x1B
-#define REG_ACCEL_CONFIG    0x1C
-#define REG_ACCEL_CONFIG2   0x1D
-#define REG_INT_PIN_CFG     0x37
-#define REG_INT_ENABLE      0x38
-#define REG_GYRO_XOUT_H     0x43
-#define REG_PWR_MGMT_1      0x6B
-#define REG_PWR_MGMT_2      0x6C
-#define REG_WHO_AM_I        0x75
+// ─────────────────────────────────────────────────────────────
+//  SETTINGS (you can leave these as-is)
+// ─────────────────────────────────────────────────────────────
+#define DEAD_ZONE         2.0f   // deg/s — gyro noise below this is ignored (prevents drift)
+#define SMOOTHING         0.30f  // 0.1 = very smooth/slow, 0.9 = very raw/fast
+#define DEBOUNCE_MS        30    // milliseconds — prevents button bounce
+#define LOOP_MS            20    // milliseconds per loop tick (50 Hz report rate)
+#define BLE_READY_MS     1500    // milliseconds to wait after connect before sending (Windows needs this)
+#define CALIB_SAMPLES     500    // gyro samples to average at startup for drift removal
 
-// Gyro full-scale = ±500 dps → sensitivity = 65.5 LSB/(°/s)
-#define GYRO_FS_SEL_500     0x08
-#define GYRO_LSB_PER_DPS    65.5f
+// ─────────────────────────────────────────────────────────────
+//  MPU6500 REGISTERS
+//  (don't touch these)
+// ─────────────────────────────────────────────────────────────
+#define MPU_ADDR   0x68
+#define PWR1       0x6B
+#define PWR2       0x6C
+#define SMPLRT     0x19
+#define DLPF_CFG   0x1A
+#define GYRO_CFG   0x1B
+#define ACC_CFG    0x1C
+#define ACC_CFG2   0x1D
+#define GYRO_OUT   0x43   // first of 6 bytes: XH XL YH YL ZH ZL
+#define WHO_AM_I   0x75
+#define GYRO_SCALE 65.5f  // LSB per °/s at ±500 dps full-scale
 
-// ═══════════════════════════════════════════════════════════════
-//  Tunable parameters
-// ═══════════════════════════════════════════════════════════════
-#define SENSITIVITY         15.0f   // deg/s → HID units (increase to move faster)
-#define DEAD_ZONE_DPS        1.8f   // °/s threshold below which movement is ignored
-#define LPF_ALPHA            0.25f  // low-pass filter weight (0=max smooth, 1=raw)
-#define CALIB_SAMPLES        500    // samples taken at startup for bias removal
-#define DEBOUNCE_MS           30    // button debounce period in ms
-#define REPORT_INTERVAL_MS    10    // target HID report period (~100 Hz)
+// ─────────────────────────────────────────────────────────────
+//  BLE MOUSE
+// ─────────────────────────────────────────────────────────────
+BleMouse mouse("Air Mouse", "ESP32", 100);
 
-// ═══════════════════════════════════════════════════════════════
-//  BLE Mouse instance
-// ═══════════════════════════════════════════════════════════════
-BleMouse bleMouse("Air Mouse", "ESP32", 100);
+// ─────────────────────────────────────────────────────────────
+//  VARIABLES
+// ─────────────────────────────────────────────────────────────
+float biasX, biasY, biasZ;     // gyro zero-rate offset (measured at startup)
+float filtX, filtY, filtZ;     // smoothed gyro values
+float accumX, accumY;           // sub-pixel accumulator (keeps fractional pixels between ticks)
 
-// ═══════════════════════════════════════════════════════════════
-//  Global state
-// ═══════════════════════════════════════════════════════════════
-float gyroBiasX = 0.0f, gyroBiasY = 0.0f, gyroBiasZ = 0.0f;
+bool     leftPressed   = false;
+bool     rightPressed  = false;
+uint32_t leftDebTime   = 0;
+uint32_t rightDebTime  = 0;
 
-// Low-pass filter accumulators
-float filtX = 0.0f, filtY = 0.0f, filtZ = 0.0f;
+bool     bleConnected  = false;
+bool     bleReady      = false;
+uint32_t connectedAt   = 0;
+uint32_t lastLoopTime  = 0;
 
-// Accumulator for sub-pixel mouse deltas (prevents quantization loss)
-float accumX = 0.0f, accumY = 0.0f;
+// ─────────────────────────────────────────────────────────────
+//  MPU6500 COMMUNICATION
+// ─────────────────────────────────────────────────────────────
 
-// Timing
-uint32_t lastReportTime = 0;
-
-// Button state
-bool  leftWasPressed  = false;
-bool  rightWasPressed = false;
-uint32_t leftDebounceTime  = 0;
-uint32_t rightDebounceTime = 0;
-
-// ═══════════════════════════════════════════════════════════════
-//  MPU6500 I2C helpers
-// ═══════════════════════════════════════════════════════════════
-
-static void mpuWrite(uint8_t reg, uint8_t val) {
+void mpuWrite(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(MPU_ADDR);
     Wire.write(reg);
     Wire.write(val);
     Wire.endTransmission();
 }
 
-static uint8_t mpuReadByte(uint8_t reg) {
+uint8_t mpuReadByte(uint8_t reg) {
     Wire.beginTransmission(MPU_ADDR);
     Wire.write(reg);
     Wire.endTransmission(false);
@@ -117,204 +129,236 @@ static uint8_t mpuReadByte(uint8_t reg) {
     return Wire.available() ? Wire.read() : 0xFF;
 }
 
-static void mpuReadBurst(uint8_t reg, uint8_t *buf, uint8_t len) {
+void mpuReadSix(uint8_t reg, uint8_t *buf) {
     Wire.beginTransmission(MPU_ADDR);
     Wire.write(reg);
     Wire.endTransmission(false);
-    Wire.requestFrom((uint8_t)MPU_ADDR, len, (uint8_t)true);
-    for (uint8_t i = 0; i < len && Wire.available(); i++) {
-        buf[i] = Wire.read();
-    }
+    Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)6, (uint8_t)true);
+    for (uint8_t i = 0; i < 6 && Wire.available(); i++) buf[i] = Wire.read();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  MPU6500 initialisation
-// ═══════════════════════════════════════════════════════════════
-static bool mpuInit() {
-    uint8_t who = mpuReadByte(REG_WHO_AM_I);
-    Serial.printf("[MPU] WHO_AM_I = 0x%02X\n", who);
+// ─────────────────────────────────────────────────────────────
+//  MPU6500 INITIALISE
+// ─────────────────────────────────────────────────────────────
 
-    // 0x70 = MPU6500, 0x68 = MPU6050, 0x71 = MPU9250 (all share this driver)
-    if (who != 0x70 && who != 0x68 && who != 0x71 && who != 0x19) {
-        Serial.printf("[MPU] ERROR: unexpected WHO_AM_I (0x%02X). Check wiring.\n", who);
+bool mpuInit() {
+    uint8_t id = mpuReadByte(WHO_AM_I);
+    Serial.printf("[MPU] WHO_AM_I = 0x%02X\n", id);
+    // 0x68 = MPU6050, 0x70 = MPU6500, 0x71 = MPU9250 — all work here
+    if (id != 0x68 && id != 0x70 && id != 0x71) {
+        Serial.println("[MPU] Not found! Check wiring.");
         return false;
     }
-
-    mpuWrite(REG_PWR_MGMT_1, 0x80);    // full device reset
-    delay(100);
-    mpuWrite(REG_PWR_MGMT_1, 0x01);    // wake up; use PLL with X-axis gyro clock
-    delay(10);
-    mpuWrite(REG_PWR_MGMT_2, 0x00);    // enable accel + gyro (all axes)
-    mpuWrite(REG_SMPLRT_DIV,  0x04);   // sample rate = gyro_rate / (1+4) = 200 Hz
-    mpuWrite(REG_CONFIG,      0x03);   // DLPF BW ≈ 41 Hz, delay ≈ 5.9 ms
-    mpuWrite(REG_GYRO_CONFIG, GYRO_FS_SEL_500);  // ±500 dps, no FCHOICE bypass
-    mpuWrite(REG_ACCEL_CONFIG,  0x00); // accel ±2 g
-    mpuWrite(REG_ACCEL_CONFIG2, 0x03); // accel DLPF 41 Hz
-
-    Serial.println("[MPU] Initialised OK.");
+    mpuWrite(PWR1,     0x80); delay(100); // full reset
+    mpuWrite(PWR1,     0x01); delay(10);  // wake up, use gyro clock
+    mpuWrite(PWR2,     0x00);             // enable gyro + accel
+    mpuWrite(SMPLRT,   0x04);             // 200 Hz sample rate
+    mpuWrite(DLPF_CFG, 0x03);             // 41 Hz low-pass filter
+    mpuWrite(GYRO_CFG, 0x08);             // ±500 dps range
+    mpuWrite(ACC_CFG,  0x00);             // ±2g range
+    mpuWrite(ACC_CFG2, 0x03);             // accel low-pass filter
+    Serial.println("[MPU] OK");
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Gyro bias calibration (run while sensor is stationary)
-// ═══════════════════════════════════════════════════════════════
-static void calibrateGyro() {
-    Serial.println("[CAL] Calibrating – keep sensor still for ~1 s ...");
+// ─────────────────────────────────────────────────────────────
+//  GYRO CALIBRATION
+//  Keep the sensor perfectly still during the first ~1 second
+// ─────────────────────────────────────────────────────────────
+
+void calibrate() {
+    Serial.println("[CAL] Keep sensor still for 1 second...");
     int64_t sx = 0, sy = 0, sz = 0;
     uint8_t buf[6];
-
     for (int i = 0; i < CALIB_SAMPLES; i++) {
-        mpuReadBurst(REG_GYRO_XOUT_H, buf, 6);
+        mpuReadSix(GYRO_OUT, buf);
         sx += (int16_t)((buf[0] << 8) | buf[1]);
         sy += (int16_t)((buf[2] << 8) | buf[3]);
         sz += (int16_t)((buf[4] << 8) | buf[5]);
         delay(2);
     }
-
-    gyroBiasX = (float)sx / CALIB_SAMPLES;
-    gyroBiasY = (float)sy / CALIB_SAMPLES;
-    gyroBiasZ = (float)sz / CALIB_SAMPLES;
-
-    Serial.printf("[CAL] Bias raw LSB → X:%.1f  Y:%.1f  Z:%.1f\n",
-                  gyroBiasX, gyroBiasY, gyroBiasZ);
+    biasX = (float)sx / CALIB_SAMPLES;
+    biasY = (float)sy / CALIB_SAMPLES;
+    biasZ = (float)sz / CALIB_SAMPLES;
+    Serial.printf("[CAL] Bias  X:%.1f  Y:%.1f  Z:%.1f\n", biasX, biasY, biasZ);
     Serial.println("[CAL] Done.");
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Read gyro → degrees/second (bias corrected)
-// ═══════════════════════════════════════════════════════════════
-static void readGyroDps(float &gx, float &gy, float &gz) {
+// ─────────────────────────────────────────────────────────────
+//  READ GYRO  →  degrees per second, bias removed
+// ─────────────────────────────────────────────────────────────
+
+void readGyro(float &gx, float &gy, float &gz) {
     uint8_t buf[6];
-    mpuReadBurst(REG_GYRO_XOUT_H, buf, 6);
-    int16_t rx = (int16_t)((buf[0] << 8) | buf[1]);
-    int16_t ry = (int16_t)((buf[2] << 8) | buf[3]);
-    int16_t rz = (int16_t)((buf[4] << 8) | buf[5]);
-    gx = (rx - gyroBiasX) / GYRO_LSB_PER_DPS;
-    gy = (ry - gyroBiasY) / GYRO_LSB_PER_DPS;
-    gz = (rz - gyroBiasZ) / GYRO_LSB_PER_DPS;
+    mpuReadSix(GYRO_OUT, buf);
+    gx = ((int16_t)((buf[0] << 8) | buf[1]) - biasX) / GYRO_SCALE;
+    gy = ((int16_t)((buf[2] << 8) | buf[3]) - biasY) / GYRO_SCALE;
+    gz = ((int16_t)((buf[4] << 8) | buf[5]) - biasZ) / GYRO_SCALE;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  setup()
-// ═══════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n====  Air Mouse  ====");
+    Serial.println("\n=== Air Mouse ===");
 
-    // Status LED
-    pinMode(LED_BUILTIN_PIN, OUTPUT);
-    digitalWrite(LED_BUILTIN_PIN, LOW);
+    // LED
+    pinMode(PIN_LED,   OUTPUT);
+    digitalWrite(PIN_LED, LOW);
 
-    // Buttons – active LOW with internal pull-up
-    pinMode(PIN_BTN_LEFT,  INPUT_PULLUP);
-    pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
+    // Buttons (active LOW — press connects pin to GND)
+    pinMode(PIN_FREEZE, INPUT_PULLUP);
+    pinMode(PIN_LEFT,   INPUT_PULLUP);
+    pinMode(PIN_RIGHT,  INPUT_PULLUP);
 
-    // I2C @ 400 kHz
-    Wire.begin(I2C_SDA, I2C_SCL);
+    // Silence the "rc=-1" BLE log message — it is harmless, just spammy
+    esp_log_level_set("BLECharacteristic", ESP_LOG_NONE);
+
+    // I2C at 400 kHz
+    Wire.begin(PIN_SDA, PIN_SCL);
     Wire.setClock(400000);
 
-    // MPU6500
+    // Start MPU6500
     if (!mpuInit()) {
-        Serial.println("[ERR] MPU6500 init failed. Halting.");
-        while (true) {
-            // Rapid blink = hardware fault
-            digitalWrite(LED_BUILTIN_PIN, !digitalRead(LED_BUILTIN_PIN));
-            delay(200);
-        }
+        // Rapid blink = hardware error, halted
+        while (true) { digitalWrite(PIN_LED, !digitalRead(PIN_LED)); delay(200); }
     }
 
-    calibrateGyro();
+    // Calibrate gyro drift
+    calibrate();
 
-    // BLE HID Mouse
-    Serial.println("[BLE] Starting BLE Mouse...");
-    bleMouse.begin();
-    Serial.println("[BLE] Advertising. Pair with 'Air Mouse' on your host device.");
+    // Start BLE mouse
+    Serial.println("[BLE] Starting...");
+    mouse.begin();
+    Serial.println("[BLE] Advertising as 'Air Mouse'");
 
-    lastReportTime = millis();
+    lastLoopTime = millis();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  loop()
-// ═══════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────
+//  LOOP
+// ─────────────────────────────────────────────────────────────
+
 void loop() {
     uint32_t now = millis();
+    static uint32_t ledBlink = 0;
 
-    // ── LED: blink slowly while waiting, solid when connected ──────────
-    static uint32_t ledToggleTime = 0;
-    if (!bleMouse.isConnected()) {
-        if (now - ledToggleTime >= 500) {
-            ledToggleTime = now;
-            digitalWrite(LED_BUILTIN_PIN, !digitalRead(LED_BUILTIN_PIN));
+    bool connected = mouse.isConnected();
+
+    // ── Detect connect / disconnect ──────────────────────────────────────────
+    if (connected && !bleConnected) {
+        bleConnected = true;
+        bleReady     = false;
+        connectedAt  = now;
+        // Reset state on fresh connect
+        filtX = filtY = filtZ = 0;
+        accumX = accumY = 0;
+        leftPressed = rightPressed = false;
+        Serial.println("[BLE] Connected — waiting for Windows HID setup...");
+    }
+    if (!connected && bleConnected) {
+        bleConnected = false;
+        bleReady     = false;
+        Serial.println("[BLE] Disconnected.");
+    }
+
+    // ── Not connected: slow blink, wait ─────────────────────────────────────
+    if (!connected) {
+        if (now - ledBlink >= 500) {
+            ledBlink = now;
+            digitalWrite(PIN_LED, !digitalRead(PIN_LED));
         }
-        // While disconnected, reset filter state so no stale values remain
-        filtX = filtY = filtZ = 0.0f;
-        accumX = accumY = 0.0f;
+        filtX = filtY = filtZ = 0;
+        accumX = accumY = 0;
         delay(10);
         return;
     }
-    // Connected
-    digitalWrite(LED_BUILTIN_PIN, HIGH);
 
-    // ── Compute actual dt since last report ─────────────────────────────
-    float dt = (now - lastReportTime) / 1000.0f;
-    if (dt < 0.001f) dt = 0.001f;   // guard against zero
-    if (dt > 0.100f) dt = 0.100f;   // cap at 100 ms to prevent huge jumps
+    // ── Just connected: fast blink for BLE_READY_MS, then go live ───────────
+    // Windows needs this time to discover services and subscribe to HID reports.
+    // Sending reports before it's ready floods Serial with rc=-1 errors.
+    if (!bleReady) {
+        if (now - connectedAt < BLE_READY_MS) {
+            if (now - ledBlink >= 100) {
+                ledBlink = now;
+                digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+            }
+            delay(10);
+            return;
+        }
+        bleReady     = true;
+        lastLoopTime = now;
+        Serial.println("[BLE] Ready!");
+    }
 
-    // ── Read gyroscope ──────────────────────────────────────────────────
+    // ── Solid LED = live ─────────────────────────────────────────────────────
+    digitalWrite(PIN_LED, HIGH);
+
+    // ── Read gyro ────────────────────────────────────────────────────────────
     float gx, gy, gz;
-    readGyroDps(gx, gy, gz);
+    readGyro(gx, gy, gz);
 
-    // ── Low-pass filter (exponential moving average) ────────────────────
-    filtX += LPF_ALPHA * (gx - filtX);
-    filtY += LPF_ALPHA * (gy - filtY);
-    filtZ += LPF_ALPHA * (gz - filtZ);
+    // ── Smooth the gyro reading (reduces jitter) ─────────────────────────────
+    filtX += SMOOTHING * (gx - filtX);
+    filtY += SMOOTHING * (gy - filtY);
+    filtZ += SMOOTHING * (gz - filtZ);
 
-    // ── Dead zone: ignore small vibrations / sensor noise ───────────────
-    float useZ = (fabsf(filtZ) > DEAD_ZONE_DPS) ? filtZ : 0.0f;  // yaw   → X
-    float useX = (fabsf(filtX) > DEAD_ZONE_DPS) ? filtX : 0.0f;  // pitch → Y
+    // ── Freeze button (D23) ──────────────────────────────────────────────────
+    // D23 floating (not pressed) → cursor moves freely
+    // D23 to GND   (pressed)     → cursor freezes (reposition hand freely)
+    bool frozen = (digitalRead(PIN_FREEZE) == LOW);
 
-    // ── Accumulate fractional pixels (prevents low-speed quantization) ──
-    //    cursor X: positive gz = turn right  → positive dx
-    //    cursor Y: positive gx = pitch up    → negative dy (screen Y is inverted)
-    accumX += useZ * SENSITIVITY * dt;
-    accumY += -useX * SENSITIVITY * dt;
+    if (!frozen) {
+        // Apply dead zone — ignore tiny gyro noise below threshold
+        float vX = (fabsf(filtZ) > DEAD_ZONE) ? filtZ : 0.0f;   // yaw   → left/right
+        float vY = (fabsf(filtX) > DEAD_ZONE) ? filtX : 0.0f;   // pitch → up/down
 
-    // Extract integer part and leave remainder in accumulator
+        // Calculate how many pixels to move this tick
+        // dt = real time since last tick in seconds
+        float dt = constrain((now - lastLoopTime) / 1000.0f, 0.001f, 0.1f);
+
+        // Negative signs correct the direction (confirmed working)
+        accumX += -vX * SENSITIVITY * dt;
+        accumY += -vY * SENSITIVITY * dt;
+    } else {
+        // Frozen — flush accumulator so no jump when released
+        accumX = 0.0f;
+        accumY = 0.0f;
+    }
+
+    // Extract whole pixels, keep the fraction for the next tick
     int8_t dx = (int8_t)constrain((int)accumX, -127, 127);
     int8_t dy = (int8_t)constrain((int)accumY, -127, 127);
     accumX -= dx;
     accumY -= dy;
 
-    // ── Send mouse movement (only when there is something to report) ─────
     if (dx != 0 || dy != 0) {
-        bleMouse.move(dx, dy, 0);
+        mouse.move(dx, dy, 0);
     }
 
-    // ── Buttons (software-debounced, press & release) ────────────────────
-    bool leftNow  = (digitalRead(PIN_BTN_LEFT)  == LOW);
-    bool rightNow = (digitalRead(PIN_BTN_RIGHT) == LOW);
-
-    // Left click
-    if (leftNow != leftWasPressed && (now - leftDebounceTime) >= DEBOUNCE_MS) {
-        leftDebounceTime = now;
-        leftWasPressed   = leftNow;
-        if (leftNow) bleMouse.press(MOUSE_LEFT);
-        else         bleMouse.release(MOUSE_LEFT);
+    // ── Left click (D19) ─────────────────────────────────────────────────────
+    bool leftNow = (digitalRead(PIN_LEFT) == LOW);
+    if (leftNow != leftPressed && (now - leftDebTime) >= DEBOUNCE_MS) {
+        leftDebTime = now;
+        leftPressed = leftNow;
+        if (leftNow) mouse.press(MOUSE_LEFT);
+        else         mouse.release(MOUSE_LEFT);
     }
 
-    // Right click
-    if (rightNow != rightWasPressed && (now - rightDebounceTime) >= DEBOUNCE_MS) {
-        rightDebounceTime = now;
-        rightWasPressed   = rightNow;
-        if (rightNow) bleMouse.press(MOUSE_RIGHT);
-        else          bleMouse.release(MOUSE_RIGHT);
+    // ── Right click (D18) ────────────────────────────────────────────────────
+    bool rightNow = (digitalRead(PIN_RIGHT) == LOW);
+    if (rightNow != rightPressed && (now - rightDebTime) >= DEBOUNCE_MS) {
+        rightDebTime = now;
+        rightPressed  = rightNow;
+        if (rightNow) mouse.press(MOUSE_RIGHT);
+        else          mouse.release(MOUSE_RIGHT);
     }
 
-    // ── Rate-limit the loop to ~REPORT_INTERVAL_MS ──────────────────────
-    lastReportTime = now;
-    uint32_t elapsed = millis() - now;
-    if (elapsed < REPORT_INTERVAL_MS) {
-        delay(REPORT_INTERVAL_MS - elapsed);
-    }
+    // ── Hold loop to LOOP_MS tick rate ───────────────────────────────────────
+    lastLoopTime = now;
+    uint32_t took = millis() - now;
+    if (took < LOOP_MS) delay(LOOP_MS - took);
 }
